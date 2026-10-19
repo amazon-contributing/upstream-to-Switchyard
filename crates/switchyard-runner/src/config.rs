@@ -1510,6 +1510,10 @@ struct LlmClientConfig {
     api_key_env: Option<String>,
     #[serde(default)]
     forward_auth: bool,
+    /// Sign requests with AWS SigV4 instead of sending a configured key, for example to call
+    /// Amazon Bedrock with IAM credentials. Cannot be combined with `api_key_env` or
+    /// `forward_auth`.
+    sigv4: Option<SigV4ClientConfig>,
     #[serde(default)]
     extra_headers: BTreeMap<String, String>,
     #[serde(default = "default_max_retries")]
@@ -1522,6 +1526,23 @@ struct LlmClientConfig {
     /// Deadline in milliseconds for all attempts and the complete response. Unset is unbounded.
     timeout_ms: Option<u64>,
     responses_reasoning: Option<ResponsesReasoningPolicy>,
+}
+
+/// `sigv4 = {}` to sign for the region in `base_url`'s host, or `sigv4 = { region = "us-east-1" }`
+/// to set it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SigV4ClientConfig {
+    /// Signing region. Omit to use the region in `base_url`'s host, or the provider chain's
+    /// (`AWS_REGION`, profile, or instance metadata) when the host names none.
+    region: Option<String>,
+    /// Signing service name. Defaults to `bedrock`.
+    #[serde(default = "default_sigv4_service")]
+    service: String,
+}
+
+fn default_sigv4_service() -> String {
+    switchyard_llm_client::sigv4::DEFAULT_SERVICE.to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1617,9 +1638,14 @@ fn build_backend(
             "llm client {client_name} timeout_ms must be at least 1"
         )));
     }
-    if config.forward_auth && config.api_key_env.is_some() {
+    // At most one auth mode per llm client.
+    let declared_auth = usize::from(config.forward_auth)
+        + usize::from(config.api_key_env.is_some())
+        + usize::from(config.sigv4.is_some());
+    if declared_auth > 1 {
         return Err(RunnerError::configuration(format!(
-            "llm client {client_name} cannot set both forward_auth and api_key_env"
+            "llm client {client_name} sets more than one of forward_auth, api_key_env and \
+             sigv4; set one"
         )));
     }
     let api_key = config
@@ -1638,6 +1664,12 @@ fn build_backend(
         max_retries: config.max_retries,
         failure_cooldown: Duration::from_millis(config.failure_cooldown_ms),
         timeout: config.timeout_ms.map(Duration::from_millis),
+        sigv4: config.sigv4.as_ref().map(|sigv4| {
+            switchyard_llm_client::sigv4::SigV4Settings::new(
+                sigv4.service.clone(),
+                sigv4.region.clone(),
+            )
+        }),
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),
@@ -3789,6 +3821,37 @@ target = "azure"
     }
 
     #[test]
+    fn an_empty_sigv4_table_configures_signing_with_no_pinned_region() {
+        // `sigv4 = {}` leaves the region unset, so it comes from `base_url`'s host.
+        let bare = VALID_CONFIG.replacen(
+            "base_url = \"https://example.test/v1\"",
+            "base_url = \"https://example.test/v1\"\n\
+             sigv4 = {}",
+            1,
+        );
+        let config: DeploymentConfig = toml::from_str(&bare).expect("empty sigv4 table parses");
+        let client = config
+            .llm_clients
+            .values()
+            .find(|client| client.sigv4.is_some())
+            .expect("the sigv4 client");
+        let sigv4 = client.sigv4.as_ref().expect("declared");
+        assert_eq!(sigv4.region, None, "an omitted region must stay unset");
+        assert_eq!(sigv4.service, "bedrock", "service defaults to bedrock");
+
+        // It also builds a runner.
+        runner_from_toml(&bare).expect("a bare sigv4 client builds");
+    }
+
+    #[test]
+    fn bedrock_sigv4_example_builds() -> RunnerResult<()> {
+        let runner = runner_from_toml(include_str!("../../../examples/bedrock-sigv4.toml"))?;
+        assert!(runner.route("bedrock").is_some());
+        assert!(runner.route("bedrock/mixed").is_some());
+        Ok(())
+    }
+
+    #[test]
     fn forward_auth_rejects_conflicting_credentials() {
         let competing_auth = VALID_CONFIG.replacen(
             "base_url = \"https://example.test/v1\"",
@@ -3798,8 +3861,25 @@ target = "azure"
             1,
         );
         assert!(
-            error_message(&competing_auth).contains("cannot set both forward_auth and api_key_env")
+            error_message(&competing_auth).contains("more than one of forward_auth, api_key_env")
         );
+
+        // sigv4 conflicts with each of the other auth modes.
+        for other in ["api_key_env = \"UNUSED_TEST_KEY\"", "forward_auth = true"] {
+            let with_sigv4 = VALID_CONFIG.replacen(
+                "base_url = \"https://example.test/v1\"",
+                &format!(
+                    "base_url = \"https://example.test/v1\"\n\
+                     sigv4 = {{ region = \"us-east-1\" }}\n\
+                     {other}"
+                ),
+                1,
+            );
+            assert!(
+                error_message(&with_sigv4).contains("more than one of forward_auth, api_key_env"),
+                "sigv4 + {other} must conflict"
+            );
+        }
 
         let static_auth = VALID_CONFIG.replacen(
             "base_url = \"https://example.test\"",

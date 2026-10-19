@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Amazon Bedrock with IAM credentials. Each llm client signs its requests with AWS SigV4, using
+# the standard AWS credential chain: environment variables, a profile with access keys or a role
+# to assume, a web identity token, or a container or instance role. Profiles that use IAM Identity
+# Center (SSO), credential_process or login_session are not supported. No API key is stored here
+# or in the environment.
+#
+# The credentials need bedrock:InvokeModel and bedrock:InvokeModelWithResponseStream on the models
+# below, and the account needs Bedrock model access for them. Replace the region and model IDs for
+# your account, then run:
+#
+#   switchyard-server --config examples/bedrock-sigv4.toml
+schema_version = 1
+
+# Claude through Bedrock's Anthropic-compatible API. An empty sigv4 table signs for the region in
+# base_url's host, so the region is set in one place.
+[llm_clients.bedrock_anthropic]
+format = "anthropic_messages"
+base_url = "https://bedrock-runtime.us-east-1.amazonaws.com/anthropic"
+sigv4 = {}
+
+# NVIDIA Nemotron and other open-weight models through Bedrock's OpenAI-compatible API.
+[llm_clients.bedrock_openai]
+format = "openai_chat"
+base_url = "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1"
+sigv4 = {}
+
+# A US cross-Region inference profile. For global routing, use the global profile instead:
+# "global.anthropic.claude-haiku-5-5". It may process requests in any commercial AWS Region,
+# and needs IAM access to the global inference profile and model.
+# base_url stays a regional endpoint either way.
+#
+# Older Claude models on Bedrock, such as Claude Haiku 4.5 and Claude Sonnet 4.6, reject
+# structured output (output_config.format). Add omit_body_fields = ["output_config"] to their
+# targets; this also drops any effort setting.
+[targets.claude]
+id = "us.anthropic.claude-haiku-5-5"
+llm_client = "bedrock_anthropic"
+
+[targets.nemotron]
+id = "nvidia.nemotron-nano-3-30b"
+llm_client = "bedrock_openai"
+
+# Every request to Claude.
+[routes.claude]
+id = "bedrock"
+type = "passthrough"
+target = "claude"
+
+# Three in four requests to Nemotron, the rest to Claude.
+[routes.mixed]
+id = "bedrock/mixed"
+type = "random"
+targets = ["nemotron", "claude"]
+weights = [3, 1]

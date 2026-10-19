@@ -146,6 +146,9 @@ pub struct TranslatingLlmClient {
     cooldown_epoch: Instant,
     // Milliseconds since cooldown_epoch. Each atomic is independent, so relaxed ordering suffices.
     unavailable_until: HashMap<ModelId, AtomicU64>,
+    // One provider chain and credential cache per client, loaded on the first signed call and
+    // shared by its backends.
+    credentials: crate::sigv4::CredentialSource,
 }
 
 impl TranslatingLlmClient {
@@ -159,6 +162,7 @@ impl TranslatingLlmClient {
                 .chain(config.other_backends.iter().flatten())
             {
                 backend.validate_configured_headers(&config.target_name)?;
+                backend.validate_sigv4(&config.target_name)?;
             }
             unavailable_until.insert(config.target_name.clone(), AtomicU64::new(0));
         }
@@ -169,7 +173,7 @@ impl TranslatingLlmClient {
         };
         let client = build_client(reqwest::Client::builder())?;
         // A redirect could move provider-specific headers to another origin.
-        // Forwarded credentials are sent only to the configured URL.
+        // Forwarded credentials and SigV4-signed requests are sent only to the configured URL.
         let forward_auth_client =
             build_client(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()))?;
         let configs_by_target = model_configs
@@ -184,6 +188,7 @@ impl TranslatingLlmClient {
             is_rate_limit_cooldown_enabled: true,
             cooldown_epoch: Instant::now(),
             unavailable_until,
+            credentials: crate::sigv4::CredentialSource::default(),
         })
     }
 
@@ -256,9 +261,14 @@ impl TranslatingLlmClient {
 
         let builder = self.forward_auth_client.get(url).timeout(timeout);
         let builder = apply_extra_headers(builder, backend);
-        let response = backend
+        let request = backend
             .apply_auth(builder)
-            .send()
+            .build()
+            .map_err(convert_reqwest_error)?;
+        let request = self.sign_if_required(request, backend).await?;
+        let response = self
+            .forward_auth_client
+            .execute(request)
             .await
             .map_err(convert_reqwest_error)?
             .error_for_status()
@@ -557,6 +567,18 @@ impl TranslatingLlmClient {
         }
     }
 
+    // Signs the request when the backend uses SigV4. Other requests pass through unchanged.
+    async fn sign_if_required(
+        &self,
+        mut request: reqwest::Request,
+        backend: &Backend,
+    ) -> std::result::Result<reqwest::Request, LlmClientError> {
+        if let Some(settings) = backend.sigv4() {
+            crate::sigv4::sign_request(&mut request, settings, &self.credentials).await?;
+        }
+        Ok(request)
+    }
+
     // Performs one HTTP attempt and retains the retry metadata alongside any error.
     async fn send_once(
         &self,
@@ -567,7 +589,7 @@ impl TranslatingLlmClient {
         target_name: &ModelId,
         streaming: bool,
     ) -> std::result::Result<EncodedResponse, AttemptFailure> {
-        let client = if backend.is_forwarding_auth() {
+        let client = if backend.is_forwarding_auth() || backend.sigv4().is_some() {
             &self.forward_auth_client
         } else {
             &self.client
@@ -578,15 +600,35 @@ impl TranslatingLlmClient {
         let builder = apply_extra_headers(builder, backend);
         let builder = backend.apply_auth(builder);
 
-        let response = match async {
-            let request = builder.build()?;
-            if let Some(body) = request.body().and_then(reqwest::Body::as_bytes) {
-                crate::payload_capture::record("request", || String::from_utf8_lossy(body));
+        // SigV4 signs the built request, because the signature covers the body. Every auth
+        // mode builds the request here and sends it with `execute`.
+        let request = match builder.build() {
+            Ok(request) => request,
+            Err(error) => {
+                metrics::record_upstream_attempt(None);
+                return Err(AttemptFailure {
+                    error: convert_reqwest_error(error),
+                    status: None,
+                    retry_after: None,
+                });
             }
-            client.execute(request).await
+        };
+        let request = match self.sign_if_required(request, backend).await {
+            Ok(request) => request,
+            Err(error) => {
+                metrics::record_upstream_attempt(None);
+                return Err(AttemptFailure {
+                    error,
+                    status: None,
+                    retry_after: None,
+                });
+            }
+        };
+        if let Some(body) = request.body().and_then(reqwest::Body::as_bytes) {
+            crate::payload_capture::record("request", || String::from_utf8_lossy(body));
         }
-        .await
-        {
+
+        let response = match client.execute(request).await {
             Ok(response) => response,
             Err(error) => {
                 metrics::record_upstream_attempt(None);
@@ -1648,6 +1690,7 @@ mod tests {
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
             timeout: None,
+            sigv4: None,
         }
     }
 
@@ -3802,6 +3845,97 @@ mod tests {
         assert_eq!(received.headers.get_all("x-custom").iter().count(), 1);
         assert_eq!(received.headers["x-custom"], "configured");
         assert_eq!(received.headers["x-configured-only"], "static");
+        Ok(())
+    }
+
+    // A library caller can set any combination of fields, so the check runs where the client
+    // is built, not only in the runner.
+    #[test]
+    fn sigv4_settings_are_checked_when_the_client_is_built() {
+        let backend_config = HttpBackendConfig {
+            sigv4: Some(crate::sigv4::SigV4Settings::new(
+                crate::sigv4::DEFAULT_SERVICE,
+                None,
+            )),
+            ..config("https://bedrock-runtime.us-east-1.amazonaws.com/anthropic")
+        };
+        let Err(error) = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(backend_config),
+            None,
+        )]) else {
+            panic!("sigv4 with an api_key must be refused");
+        };
+        assert!(error.to_string().contains("one auth mode"), "{error}");
+    }
+
+    // reqwest drops `Authorization` on a cross-origin redirect but keeps
+    // `x-amz-security-token` and, on a 307, the body.
+    #[tokio::test]
+    async fn sigv4_requests_do_not_follow_redirects()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let other_origin = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1", "model": "gpt",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {}
+            })))
+            .mount(&other_origin)
+            .await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(307).insert_header(
+                "location",
+                format!("{}/v1/chat/completions", other_origin.uri()),
+            ))
+            .mount(&upstream)
+            .await;
+
+        let backend_config = HttpBackendConfig {
+            api_key: None,
+            sigv4: Some(crate::sigv4::SigV4Settings::new(
+                crate::sigv4::DEFAULT_SERVICE,
+                Some("us-east-1".to_string()),
+            )),
+            ..config(&format!("{}/v1", upstream.uri()))
+        };
+        let mut client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(backend_config),
+            None,
+        )])?;
+        client.credentials = crate::sigv4::CredentialSource::for_tests(
+            aws_credential_types::Credentials::for_tests_with_session_token(),
+            Some("us-east-1"),
+        );
+
+        let result = client
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await;
+        assert!(
+            result.is_err(),
+            "a redirect must not complete a signed call"
+        );
+        let signed = upstream
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        assert!(
+            signed
+                .first()
+                .ok_or("expected one upstream request")?
+                .headers
+                .contains_key("x-amz-security-token")
+        );
+        let redirected = other_origin
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        assert!(
+            redirected.is_empty(),
+            "the signed request followed a redirect"
+        );
         Ok(())
     }
 

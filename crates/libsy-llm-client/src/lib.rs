@@ -31,6 +31,7 @@ mod openai_decisions;
 mod payload_capture;
 mod responses_reasoning;
 pub mod run;
+pub mod sigv4;
 mod system_one;
 
 pub use backend::{Backend, DEFAULT_MAX_RETRIES, HttpBackendConfig};
