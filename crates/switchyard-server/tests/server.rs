@@ -833,6 +833,7 @@ fn random_state_with_retries(
         max_retries,
         failure_cooldown: std::time::Duration::ZERO,
         timeout: None,
+        sigv4: None,
     });
     let target_models = routes
         .iter()

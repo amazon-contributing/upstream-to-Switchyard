@@ -88,6 +88,10 @@ pub struct HttpBackendConfig {
     /// Deadline for one complete response, including retries, retry delays, and stream reads.
     /// `None` leaves the wait unbounded.
     pub timeout: Option<Duration>,
+    /// Sign every request with AWS SigV4 instead of sending a configured key, for example to
+    /// call Amazon Bedrock with IAM credentials. Cannot be combined with `api_key` or
+    /// `forward_auth`.
+    pub sigv4: Option<crate::sigv4::SigV4Settings>,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -276,6 +280,19 @@ impl Backend {
         }
     }
 
+    /// The SigV4 settings for this backend, when it signs rather than sends a key.
+    pub(crate) fn sigv4(&self) -> Option<&crate::sigv4::SigV4Settings> {
+        self.config().sigv4.as_ref()
+    }
+
+    /// Checks the SigV4 settings of a backend that signs. Other backends always pass.
+    pub(crate) fn validate_sigv4(&self, model_name: &str) -> Result<()> {
+        match self.sigv4() {
+            Some(_) => crate::sigv4::validate(self.config(), model_name),
+            None => Ok(()),
+        }
+    }
+
     /// Applies only the caller credential accepted by this provider.
     pub(crate) fn apply_forwarded_auth(
         &self,
@@ -458,6 +475,7 @@ mod tests {
             max_retries: 0,
             failure_cooldown: Duration::ZERO,
             timeout: None,
+            sigv4: None,
         }
     }
 

@@ -148,6 +148,7 @@ async fn fallback_credit_retry_child() -> TestResult {
                 max_retries: 0,
                 failure_cooldown: std::time::Duration::ZERO,
                 timeout: None,
+                sigv4: None,
             }),
             None,
         )

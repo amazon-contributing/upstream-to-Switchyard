@@ -20,6 +20,9 @@ publish = ["crates-io"]
 switchyard-libsy.workspace = true
 switchyard-protocol.workspace = true
 switchyard-translation.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sigv4.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true
 futures.workspace = true
@@ -36,6 +39,10 @@ tracing-opentelemetry.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# `test-util` provides `Credentials::for_tests_with_session_token`.
+aws-credential-types = { workspace = true, features = ["test-util"] }
+# Checks that a default async sleep exists for the credential providers.
+aws-smithy-async.workspace = true
 # SDK + in-memory exporter to assert what the observability layer records.
 opentelemetry_sdk = { workspace = true, default-features = true, features = ["metrics", "testing", "trace"] }
 thiserror.workspace = true

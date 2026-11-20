@@ -53,7 +53,8 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 | `context_discovery` | No | unset | Set to `"llama_cpp"` to enable `/props` context discovery for VGR efficient targets. Disabled when unset. An explicit route `context_window` takes precedence. |
 | `api_key_env` | No | unset | Name of the environment variable holding the key. Omit to send no authentication. |
 | `forward_auth` | No | `false` | Forward the caller's provider credential and application headers. A route's forwarding clients must use one credential family unless they all use the same scheme, host, and port, such as one LLM gateway. |
-| `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. Configured values replace caller values for the same name. |
+| `sigv4` | No | unset | Sign every request with AWS SigV4, for Amazon Bedrock. Write `sigv4 = {}` to sign for the region in `base_url`'s host, such as `us-east-1` in `bedrock-runtime.us-east-1.amazonaws.com`. When the host is outside AWS or names no region, the AWS environment's region is used. Write `sigv4 = { region = "us-east-1" }` to set it explicitly. `service` defaults to `"bedrock"`. `base_url` must use `https`, except on `localhost` and other loopback addresses. Anyone who reads a signed request can send it again for about 15 minutes, so point `base_url` only at hosts you trust. Credentials come from the standard AWS credential provider chain, and Switchyard fetches them again shortly before they expire. Profiles that use `sso_session`, `sso_start_url`, `credential_process` or `login_session` are not supported. Cannot be combined with `api_key_env` or `forward_auth`. See [`examples/bedrock-sigv4.toml`](../../examples/bedrock-sigv4.toml). |
+| `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `forward_auth`, `sigv4` or `api_key_env`; the server rejects headers owned by the selected auth mode. With `sigv4`, these are `authorization`, `host` and every `x-amz-` header. Header names are case-insensitive. Configured values replace caller values for the same name. |
 | `responses_reasoning` | No | `"auto"` | Responses reasoning replay: `"auto"`, `"preserve_encrypted"`, `"preserve_plaintext"`, or `"drop"`. Only valid for `openai_responses`. |
 | `fallback_on_rate_limit` | No | `true` | Try another completion candidate after an upstream HTTP 429 exhausts retries. Set to `false` to return the 429 instead. |
 | `max_retries` | No | `2` | Retry budget, `0`–`10`. |
@@ -88,6 +89,7 @@ when no target uses the client.
 
 The TOML never contains the secret itself. `api_key_env` names a variable that
 must exist and be non-empty when the server loads.
+With `sigv4`, the TOML holds no credentials at all.
 
 Cooldown is enabled by default for 5 seconds. Set `failure_cooldown_ms = 0` to disable it.
 The cooldown starts after retries are exhausted.
