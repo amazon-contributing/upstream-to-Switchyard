@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_SERVICE"],"fn":["sign_request"],"struct":["CredentialSource","SigV4Settings"]};
